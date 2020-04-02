@@ -19,12 +19,21 @@ from minigraph import parse_device_desc_xml
 
 import aaa
 import mlnx
+import nat
 
 CONTEXT_SETTINGS = dict(help_option_names=['-h', '--help', '-?'])
 
+SONIC_GENERATED_SERVICE_PATH = '/etc/sonic/generated_services.conf'
 SONIC_CFGGEN_PATH = '/usr/local/bin/sonic-cfggen'
 SYSLOG_IDENTIFIER = "config"
 VLAN_SUB_INTERFACE_SEPARATOR = '.'
+ASIC_CONF_FILENAME = 'asic.conf'
+
+INIT_CFG_FILE = '/etc/sonic/init_cfg.json'
+
+SYSTEMCTL_ACTION_STOP="stop"
+SYSTEMCTL_ACTION_RESTART="restart"
+SYSTEMCTL_ACTION_RESET_FAILED="reset-failed"
 
 # ========================== Syslog wrappers ==========================
 
@@ -65,6 +74,31 @@ except KeyError, TypeError:
 # Helper functions
 #
 
+# Execute action on list of systemd services
+def execute_systemctl(list_of_services, action):
+    num_asic = _get_num_asic()
+    generated_services_list, generated_multi_instance_services = _get_sonic_generated_services(num_asic)
+    if ((generated_services_list == []) and
+        (generated_multi_instance_services == [])):
+        log_error("Failed to get generated services")
+        return
+
+    for service in list_of_services:
+        if (service + '.service' in generated_services_list):
+            try:
+                click.echo("Executing {} of service {}...".format(action, service))
+                run_command("systemctl {} {}".format(action, service))
+            except SystemExit as e:
+                log_error("Failed to execute {} of service {} with error {}".format(action, service, e))
+                raise
+        if (service + '.service' in generated_multi_instance_services):
+            for inst in range(num_asic):
+                try:
+                    click.echo("Executing {} of service {}@{}...".format(action, service, inst))
+                    run_command("systemctl {} {}@{}.service".format(action, service, inst))
+                except SystemExit as e:
+                    log_error("Failed to execute {} of service {}@{} with error {}".format(action, service, inst, e))
+                    raise
 
 def run_command(command, display_cmd=False, ignore_error=False):
     """Run bash command and print output to stdout
@@ -391,6 +425,35 @@ def _get_platform():
                 return tokens[1].strip()
     return ''
 
+def _get_num_asic():
+    platform = _get_platform()
+    num_asic = 1
+    asic_conf_file = os.path.join('/usr/share/sonic/device/', platform, ASIC_CONF_FILENAME)
+    if os.path.isfile(asic_conf_file):
+        with open(asic_conf_file) as conf_file:
+            for line in conf_file:
+                line_info = line.split('=')
+                if line_info[0].lower() == "num_asic":
+                    num_asic = int(line_info[1])
+    return num_asic
+
+def _get_sonic_generated_services(num_asic):
+    if not os.path.isfile(SONIC_GENERATED_SERVICE_PATH):
+        return None
+    generated_services_list = []
+    generated_multi_instance_services = []
+    with open(SONIC_GENERATED_SERVICE_PATH) as generated_service_file:
+        for line in generated_service_file:
+            if '@' in line:
+                line = line.replace('@', '')
+                if num_asic > 1:
+                    generated_multi_instance_services.append(line.rstrip('\n'))
+                else:
+                    generated_services_list.append(line.rstrip('\n'))
+            else:
+                generated_services_list.append(line.rstrip('\n'))
+    return generated_services_list, generated_multi_instance_services
+
 # Callback for confirmation prompt. Aborts if user enters "n"
 def _abort_if_false(ctx, param, value):
     if not value:
@@ -404,18 +467,13 @@ def _stop_services():
         'pmon',
         'bgp',
         'hostcfgd',
+        'nat'
     ]
+
     if asic_type == 'mellanox' and 'pmon' in services_to_stop:
         services_to_stop.remove('pmon')
 
-    for service in services_to_stop:
-        try:
-            click.echo("Stopping service {} ...".format(service))
-            run_command("systemctl stop {}".format(service))
-
-        except SystemExit as e:
-            log_error("Stopping {} failed with error {}".format(service, e))
-            raise
+    execute_systemctl(services_to_stop, SYSTEMCTL_ACTION_STOP)
 
 def _reset_failed_services():
     services_to_reset = [
@@ -432,16 +490,13 @@ def _reset_failed_services():
         'snmp',
         'swss',
         'syncd',
-        'teamd'
+        'teamd',
+        'nat',
+        'sflow'
     ]
+    execute_systemctl(services_to_reset, SYSTEMCTL_ACTION_RESET_FAILED)
 
-    for service in services_to_reset:
-        try:
-            click.echo("Resetting failed status for service {} ...".format(service))
-            run_command("systemctl reset-failed {}".format(service))
-        except SystemExit as e:
-            log_error("Failed to reset failed status for service {}".format(service))
-            raise
+
 
 def _restart_services():
     # on Mellanox platform pmon is started by syncd
@@ -455,18 +510,15 @@ def _restart_services():
         'pmon',
         'lldp',
         'hostcfgd',
+        'nat',
         'sflow',
     ]
+
     if asic_type == 'mellanox' and 'pmon' in services_to_restart:
         services_to_restart.remove('pmon')
 
-    for service in services_to_restart:
-        try:
-            click.echo("Restarting service {} ...".format(service))
-            run_command("systemctl restart {}".format(service))
-        except SystemExit as e:
-            log_error("Restart {} failed with error {}".format(service, e))
-            raise
+    execute_systemctl(services_to_restart, SYSTEMCTL_ACTION_RESTART)
+
 
 def is_ipaddress(val):
     """ Validate if an entry is a valid IP """
@@ -487,6 +539,8 @@ def config():
         exit("Root privileges are required for this operation")
 config.add_command(aaa.aaa)
 config.add_command(aaa.tacacs)
+# === Add NAT Configuration ==========
+config.add_command(nat.nat)
 
 @config.command()
 @click.option('-y', '--yes', is_flag=True, callback=_abort_if_false,
@@ -529,6 +583,7 @@ def reload(filename, yes, load_sysinfo):
             cfg_hwsku = cfg_hwsku.strip()
 
     #Stop services before config push
+    log_info("'reload' stopping services...")
     _stop_services()
     config_db = ConfigDBConnector()
     config_db.connect()
@@ -538,7 +593,11 @@ def reload(filename, yes, load_sysinfo):
         command = "{} -H -k {} --write-to-db".format(SONIC_CFGGEN_PATH, cfg_hwsku)
         run_command(command, display_cmd=True)
 
-    command = "{} -j {} --write-to-db".format(SONIC_CFGGEN_PATH, filename)
+    if os.path.isfile(INIT_CFG_FILE):
+        command = "{} -j {} -j {} --write-to-db".format(SONIC_CFGGEN_PATH, INIT_CFG_FILE, filename)
+    else:
+        command = "{} -j {} --write-to-db".format(SONIC_CFGGEN_PATH, filename)
+
     run_command(command, display_cmd=True)
     client.set(config_db.INIT_INDICATOR, 1)
 
@@ -550,9 +609,10 @@ def reload(filename, yes, load_sysinfo):
     # We first run "systemctl reset-failed" to remove the "failed"
     # status from all services before we attempt to restart them
     _reset_failed_services()
+    log_info("'reload' restarting services...")
     _restart_services()
 
-@config.command()
+@config.command("load_mgmt_config")
 @click.option('-y', '--yes', is_flag=True, callback=_abort_if_false,
                 expose_value=False, prompt='Reload mgmt config?')
 @click.argument('filename', default='/etc/sonic/device_desc.xml', type=click.Path(exists=True))
@@ -576,7 +636,7 @@ def load_mgmt_config(filename):
     run_command(command, display_cmd=True, ignore_error=True)
     click.echo("Please note loaded setting will be lost after system reboot. To preserve setting, run `config save`.")
 
-@config.command()
+@config.command("load_minigraph")
 @click.option('-y', '--yes', is_flag=True, callback=_abort_if_false,
                 expose_value=False, prompt='Reload config from minigraph?')
 def load_minigraph():
@@ -594,6 +654,7 @@ def load_minigraph():
         device_type = device_type.strip()
 
     #Stop services before config push
+    log_info("'load_minigraph' stopping services...")
     _stop_services()
 
     config_db = ConfigDBConnector()
@@ -621,6 +682,7 @@ def load_minigraph():
     # status from all services before we attempt to restart them
     _reset_failed_services()
     #FIXME: After config DB daemon is implemented, we'll no longer need to restart every service.
+    log_info("'load_minigraph' restarting services...")
     _restart_services()
     click.echo("Please note setting loaded from minigraph will be lost after system reboot. To preserve setting, run `config save`.")
 
@@ -756,6 +818,91 @@ def remove(session_name):
     config_db.connect()
     config_db.set_entry("MIRROR_SESSION", session_name, None)
 
+#
+# 'pfcwd' group ('config pfcwd ...')
+#
+@config.group()
+def pfcwd():
+    """Configure pfc watchdog """
+    pass
+
+@pfcwd.command()
+@click.option('--action', '-a', type=click.Choice(['drop', 'forward', 'alert']))
+@click.option('--restoration-time', '-r', type=click.IntRange(100, 60000))
+@click.option('--verbose', is_flag=True, help="Enable verbose output")
+@click.argument('ports', nargs=-1)
+@click.argument('detection-time', type=click.IntRange(100, 5000))
+def start(action, restoration_time, ports, detection_time, verbose):
+    """
+    Start PFC watchdog on port(s). To config all ports, use all as input.
+
+    Example:
+        config pfcwd start --action drop ports all detection-time 400 --restoration-time 400
+    """
+    cmd = "pfcwd start"
+
+    if action:
+        cmd += " --action {}".format(action)
+
+    if ports:
+        ports = set(ports) - set(['ports', 'detection-time'])
+        cmd += " ports {}".format(' '.join(ports))
+
+    if detection_time:
+        cmd += " detection-time {}".format(detection_time)
+
+    if restoration_time:
+        cmd += " --restoration-time {}".format(restoration_time)
+
+    run_command(cmd, display_cmd=verbose)
+
+@pfcwd.command()
+@click.option('--verbose', is_flag=True, help="Enable verbose output")
+def stop(verbose):
+    """ Stop PFC watchdog """
+
+    cmd = "pfcwd stop"
+
+    run_command(cmd, display_cmd=verbose)
+
+@pfcwd.command()
+@click.option('--verbose', is_flag=True, help="Enable verbose output")
+@click.argument('poll_interval', type=click.IntRange(100, 3000))
+def interval(poll_interval, verbose):
+    """ Set PFC watchdog counter polling interval (ms) """
+
+    cmd = "pfcwd interval {}".format(poll_interval)
+
+    run_command(cmd, display_cmd=verbose)
+
+@pfcwd.command()
+@click.option('--verbose', is_flag=True, help="Enable verbose output")
+@click.argument('counter_poll', type=click.Choice(['enable', 'disable']))
+def counter_poll(counter_poll, verbose):
+    """ Enable/disable counter polling """
+
+    cmd = "pfcwd counter_poll {}".format(counter_poll)
+
+    run_command(cmd, display_cmd=verbose)
+
+@pfcwd.command()
+@click.option('--verbose', is_flag=True, help="Enable verbose output")
+@click.argument('big_red_switch', type=click.Choice(['enable', 'disable']))
+def big_red_switch(big_red_switch, verbose):
+    """ Enable/disable BIG_RED_SWITCH mode """
+
+    cmd = "pfcwd big_red_switch {}".format(big_red_switch)
+
+    run_command(cmd, display_cmd=verbose)
+
+@pfcwd.command()
+@click.option('--verbose', is_flag=True, help="Enable verbose output")
+def start_default(verbose):
+    """ Start PFC WD by default configurations  """
+
+    cmd = "pfcwd start_default"
+
+    run_command(cmd, display_cmd=verbose)
 
 #
 # 'qos' group ('config qos ...')
@@ -929,6 +1076,7 @@ def add_vlan_member(ctx, vid, interface_name, untagged):
     db = ctx.obj['db']
     vlan_name = 'Vlan{}'.format(vid)
     vlan = db.get_entry('VLAN', vlan_name)
+    interface_table = db.get_table('INTERFACE')
 
     if get_interface_naming_mode() == "alias":
         interface_name = interface_alias_to_name(interface_name)
@@ -948,6 +1096,10 @@ def add_vlan_member(ctx, vid, interface_name, untagged):
         else:
             ctx.fail("{} is already a member of {}".format(interface_name,
                                                         vlan_name))
+    for entry in interface_table:
+        if (interface_name == entry[0]):
+            ctx.fail("{} is a L3 interface!".format(interface_name))
+            
     members.append(interface_name)
     vlan['members'] = members
     db.set_entry('VLAN', vlan_name, vlan)
@@ -1004,11 +1156,9 @@ def mvrf_restart_services():
     cmd="service ntp start"
     os.system (cmd)
 
-def vrf_add_management_vrf():
+def vrf_add_management_vrf(config_db):
     """Enable management vrf in config DB"""
 
-    config_db = ConfigDBConnector()
-    config_db.connect()
     entry = config_db.get_entry('MGMT_VRF_CONFIG', "vrf_global")
     if entry and entry['mgmtVrfEnabled'] == 'true' :
         click.echo("ManagementVRF is already Enabled.")
@@ -1016,46 +1166,15 @@ def vrf_add_management_vrf():
     config_db.mod_entry('MGMT_VRF_CONFIG',"vrf_global",{"mgmtVrfEnabled": "true"})
     mvrf_restart_services()
 
-def vrf_delete_management_vrf():
+def vrf_delete_management_vrf(config_db):
     """Disable management vrf in config DB"""
 
-    config_db = ConfigDBConnector()
-    config_db.connect()
     entry = config_db.get_entry('MGMT_VRF_CONFIG', "vrf_global")
     if not entry or entry['mgmtVrfEnabled'] == 'false' :
         click.echo("ManagementVRF is already Disabled.")
         return None
     config_db.mod_entry('MGMT_VRF_CONFIG',"vrf_global",{"mgmtVrfEnabled": "false"})
     mvrf_restart_services()
-
-#
-# 'vrf' group ('config vrf ...')
-#
-
-@config.group('vrf')
-def vrf():
-    """VRF-related configuration tasks"""
-    pass
-
-@vrf.command('add')
-@click.argument('vrfname', metavar='<vrfname>. Type mgmt for management VRF', required=True)
-@click.pass_context
-def vrf_add (ctx, vrfname):
-    """Create management VRF and move eth0 into it"""
-    if vrfname == 'mgmt' or vrfname == 'management':
-        vrf_add_management_vrf()
-    else:
-        click.echo("Creation of data vrf={} is not yet supported".format(vrfname))
-
-@vrf.command('del')
-@click.argument('vrfname', metavar='<vrfname>. Type mgmt for management VRF', required=False)
-@click.pass_context
-def vrf_del (ctx, vrfname):
-    """Delete management VRF and move back eth0 to default VRF"""
-    if vrfname == 'mgmt' or vrfname == 'management':
-        vrf_delete_management_vrf()
-    else:
-        click.echo("Deletion of data vrf={} is not yet supported".format(vrfname))
 
 @config.group()
 @click.pass_context
@@ -1180,7 +1299,8 @@ def add_vlan_dhcp_relay_destination(ctx, vid, dhcp_relay_destination_ip):
         return
     else:
         dhcp_relay_dests.append(dhcp_relay_destination_ip)
-        db.set_entry('VLAN', vlan_name, {"dhcp_servers":dhcp_relay_dests})
+        vlan['dhcp_servers'] = dhcp_relay_dests
+        db.set_entry('VLAN', vlan_name, vlan)
         click.echo("Added DHCP relay destination address {} to {}".format(dhcp_relay_destination_ip, vlan_name))
         try:
             click.echo("Restarting DHCP relay service...")
@@ -1205,7 +1325,11 @@ def del_vlan_dhcp_relay_destination(ctx, vid, dhcp_relay_destination_ip):
     dhcp_relay_dests = vlan.get('dhcp_servers', [])
     if dhcp_relay_destination_ip in dhcp_relay_dests:
         dhcp_relay_dests.remove(dhcp_relay_destination_ip)
-        db.set_entry('VLAN', vlan_name, {"dhcp_servers":dhcp_relay_dests})
+        if len(dhcp_relay_dests) == 0:
+            del vlan['dhcp_servers']
+        else:
+            vlan['dhcp_servers'] = dhcp_relay_dests
+        db.set_entry('VLAN', vlan_name, vlan)
         click.echo("Removed DHCP relay destination address {} from {}".format(dhcp_relay_destination_ip, vlan_name))
         try:
             click.echo("Restarting DHCP relay service...")
@@ -1232,6 +1356,51 @@ def bgp():
 def shutdown():
     """Shut down BGP session(s)"""
     pass
+
+@config.group()
+def kdump():
+    """ Configure kdump """
+    if os.geteuid() != 0:
+        exit("Root privileges are required for this operation")
+    pass
+
+@kdump.command()
+def disable():
+    """Disable kdump operation"""
+    config_db = ConfigDBConnector()
+    if config_db is not None:
+        config_db.connect()
+        config_db.mod_entry("KDUMP", "config", {"enabled": "false"})
+        run_command("sonic-kdump-config --disable")
+
+@kdump.command()
+def enable():
+    """Enable kdump operation"""
+    config_db = ConfigDBConnector()
+    if config_db is not None:
+        config_db.connect()
+        config_db.mod_entry("KDUMP", "config", {"enabled": "true"})
+        run_command("sonic-kdump-config --enable")
+
+@kdump.command()
+@click.argument('kdump_memory', metavar='<kdump_memory>', required=True)
+def memory(kdump_memory):
+    """Set memory allocated for kdump capture kernel"""
+    config_db = ConfigDBConnector()
+    if config_db is not None:
+        config_db.connect()
+        config_db.mod_entry("KDUMP", "config", {"memory": kdump_memory})
+        run_command("sonic-kdump-config --memory %s" % kdump_memory)
+
+@kdump.command()
+@click.argument('kdump_num_dumps', metavar='<kdump_num_dumps>', required=True, type=int)
+def num_dumps(kdump_num_dumps):
+    """Set max number of dump files for kdump"""
+    config_db = ConfigDBConnector()
+    if config_db is not None:
+        config_db.connect()
+        config_db.mod_entry("KDUMP", "config", {"num_dumps": kdump_num_dumps})
+        run_command("sonic-kdump-config --num_dumps %d" % kdump_num_dumps)
 
 # 'all' subcommand
 @shutdown.command()
@@ -1399,6 +1568,27 @@ def mgmt_ip_restart_services():
     os.system (cmd)
     cmd="systemctl restart ntp-config"
     os.system (cmd)
+
+#
+# 'mtu' subcommand
+#
+
+@interface.command()
+@click.pass_context
+@click.argument('interface_name', metavar='<interface_name>', required=True)
+@click.argument('interface_mtu', metavar='<interface_mtu>', required=True)
+@click.option('-v', '--verbose', is_flag=True, help="Enable verbose output")
+def mtu(ctx, interface_name, interface_mtu, verbose):
+    """Set interface mtu"""
+    if get_interface_naming_mode() == "alias":
+        interface_name = interface_alias_to_name(interface_name)
+        if interface_name is None:
+            ctx.fail("'interface_name' is None!")
+
+    command = "portconfig -p {} -m {}".format(interface_name, interface_mtu)
+    if verbose:
+        command += " -vv"
+    run_command(command, display_cmd=verbose)
 
 #
 # 'ip' subgroup ('config interface ip ...')
@@ -1581,7 +1771,7 @@ def unbind(ctx, interface_name):
 # 'vrf' group ('config vrf ...')
 #
 
-@config.group()
+@config.group('vrf')
 @click.pass_context
 def vrf(ctx):
     """VRF-related configuration tasks"""
@@ -1597,11 +1787,14 @@ def vrf(ctx):
 def add_vrf(ctx, vrf_name):
     """Add vrf"""
     config_db = ctx.obj['config_db']
-    if not vrf_name.startswith("Vrf"):
-        ctx.fail("'vrf_name' is not start with Vrf!")
+    if not vrf_name.startswith("Vrf") and not (vrf_name == 'mgmt') and not (vrf_name == 'management'):
+        ctx.fail("'vrf_name' is not start with Vrf, mgmt or management!")
     if len(vrf_name) > 15:
         ctx.fail("'vrf_name' is too long!")
-    config_db.set_entry('VRF', vrf_name, {"NULL": "NULL"})
+    if (vrf_name == 'mgmt' or vrf_name == 'management'):
+        vrf_add_management_vrf(config_db)
+    else:
+        config_db.set_entry('VRF', vrf_name, {"NULL": "NULL"})
 
 @vrf.command('del')
 @click.argument('vrf_name', metavar='<vrf_name>', required=True)
@@ -1609,12 +1802,15 @@ def add_vrf(ctx, vrf_name):
 def del_vrf(ctx, vrf_name):
     """Del vrf"""
     config_db = ctx.obj['config_db']
-    if not vrf_name.startswith("Vrf"):
-        ctx.fail("'vrf_name' is not start with Vrf!")
+    if not vrf_name.startswith("Vrf") and not (vrf_name == 'mgmt') and not (vrf_name == 'management'):
+        ctx.fail("'vrf_name' is not start with Vrf, mgmt or management!")
     if len(vrf_name) > 15:
         ctx.fail("'vrf_name' is too long!")
-    del_interface_bind_to_vrf(config_db, vrf_name)
-    config_db.set_entry('VRF', vrf_name, None)
+    if (vrf_name == 'mgmt' or vrf_name == 'management'):
+        vrf_delete_management_vrf(config_db)
+    else:
+        del_interface_bind_to_vrf(config_db, vrf_name)
+        config_db.set_entry('VRF', vrf_name, None)
 
 
 #
@@ -2000,6 +2196,48 @@ def platform():
 if asic_type == 'mellanox':
     platform.add_command(mlnx.mlnx)
 
+# 'firmware' subgroup ("config platform firmware ...")
+@platform.group()
+def firmware():
+    """Firmware configuration tasks"""
+    pass
+
+# 'install' subcommand ("config platform firmware install")
+@firmware.command(
+    context_settings=dict(
+        ignore_unknown_options=True,
+        allow_extra_args=True
+    ),
+    add_help_option=False
+)
+@click.argument('args', nargs=-1, type=click.UNPROCESSED)
+def install(args):
+    """Install platform firmware"""
+    cmd = "fwutil install {}".format(" ".join(args))
+
+    try:
+        subprocess.check_call(cmd, shell=True)
+    except subprocess.CalledProcessError as e:
+        sys.exit(e.returncode)
+
+# 'update' subcommand ("config platform firmware update")
+@firmware.command(
+    context_settings=dict(
+        ignore_unknown_options=True,
+        allow_extra_args=True
+    ),
+    add_help_option=False
+)
+@click.argument('args', nargs=-1, type=click.UNPROCESSED)
+def update(args):
+    """Update platform firmware"""
+    cmd = "fwutil update {}".format(" ".join(args))
+
+    try:
+        subprocess.check_call(cmd, shell=True)
+    except subprocess.CalledProcessError as e:
+        sys.exit(e.returncode)
+
 #
 # 'watermark' group ("show watermark telemetry interval")
 #
@@ -2040,6 +2278,41 @@ def naming_mode_default():
 def naming_mode_alias():
     """Set CLI interface naming mode to ALIAS (Vendor port alias)"""
     set_interface_naming_mode('alias')
+
+@config.group()
+def ztp():
+    """ Configure Zero Touch Provisioning """
+    if os.path.isfile('/usr/bin/ztp') is False:
+        exit("ZTP feature unavailable in this image version")
+
+    if os.geteuid() != 0:
+        exit("Root privileges are required for this operation")
+    pass
+
+@ztp.command()
+@click.option('-y', '--yes', is_flag=True, callback=_abort_if_false,
+                expose_value=False, prompt='ZTP will be restarted. You may lose switch data and connectivity, continue?')
+@click.argument('run', required=False, type=click.Choice(["run"]))
+def run(run):
+    """Restart ZTP of the device."""
+    command = "ztp run -y"
+    run_command(command, display_cmd=True)
+
+@ztp.command()
+@click.option('-y', '--yes', is_flag=True, callback=_abort_if_false,
+                expose_value=False, prompt='Active ZTP session will be stopped and disabled, continue?')
+@click.argument('disable', required=False, type=click.Choice(["disable"]))
+def disable(disable):
+    """Administratively Disable ZTP."""
+    command = "ztp disable -y"
+    run_command(command, display_cmd=True)
+
+@ztp.command()
+@click.argument('enable', required=False, type=click.Choice(["enable"]))
+def enable(enable):
+    """Administratively Enable ZTP."""
+    command = "ztp enable"
+    run_command(command, display_cmd=True)
 
 #
 # 'syslog' group ('config syslog ...')
@@ -2175,6 +2448,17 @@ def enable(ctx):
         sflow_tbl['global']['admin_state'] = 'up'
 
     config_db.mod_entry('SFLOW', 'global', sflow_tbl['global'])
+
+    try:
+        proc = subprocess.Popen("systemctl is-active sflow", shell=True, stdout=subprocess.PIPE)
+        (out, err) = proc.communicate()
+    except SystemExit as e:
+        ctx.fail("Unable to check sflow status {}".format(e))
+
+    if out != "active":
+        log_info("sflow service is not enabled. Starting sflow docker...")
+        run_command("sudo systemctl enable sflow")
+        run_command("sudo systemctl start sflow")
 
 #
 # 'sflow' command ('config sflow disable')
@@ -2432,6 +2716,42 @@ def feature_status(name, state):
         return
 
     config_db.mod_entry('FEATURE', name, {'status': state})
+
+#
+# 'container' group ('config container ...')
+#
+@config.group(name='container', invoke_without_command=False)
+def container():
+    """Modify configuration of containers"""
+    pass
+
+#
+# 'feature' group ('config container feature ...')
+#
+@container.group(name='feature', invoke_without_command=False)
+def feature():
+    """Modify configuration of container features"""
+    pass
+
+#
+# 'autorestart' subcommand ('config container feature autorestart ...')
+#
+@feature.command(name='autorestart', short_help="Configure the status of autorestart feature for specific container")
+@click.argument('container_name', metavar='<container_name>', required=True)
+@click.argument('autorestart_status', metavar='<autorestart_status>', required=True, type=click.Choice(["enabled", "disabled"]))
+def autorestart(container_name, autorestart_status):
+    config_db = ConfigDBConnector()
+    config_db.connect()
+    container_feature_table = config_db.get_table('CONTAINER_FEATURE')
+    if not container_feature_table:
+        click.echo("Unable to retrieve container feature table from Config DB.")
+        return
+
+    if not container_feature_table.has_key(container_name):
+        click.echo("Unable to retrieve features for container '{}'".format(container_name))
+        return
+
+    config_db.mod_entry('CONTAINER_FEATURE', container_name, {'auto_restart': autorestart_status})
 
 if __name__ == '__main__':
     config()
