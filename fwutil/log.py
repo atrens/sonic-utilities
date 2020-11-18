@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 #
 # log.py
 #
@@ -7,7 +6,7 @@
 
 try:
     import click
-    import syslog
+    from sonic_py_common import logger
 except ImportError as e:
     raise ImportError("Required module not found: {}".format(str(e)))
 
@@ -15,42 +14,13 @@ except ImportError as e:
 
 SYSLOG_IDENTIFIER = "fwutil"
 
+# ========================= Variables ==========================================
+
+# Global logger instance
+log = logger.Logger(SYSLOG_IDENTIFIER)
+log.set_min_log_priority_info()
+
 # ========================= Helper classes =====================================
-
-class SyslogLogger(object):
-    """
-    SyslogLogger
-    """
-    def __init__(self, identifier):
-        self.__syslog = syslog
-
-        self.__syslog.openlog(
-            ident=identifier,
-            logoption=self.__syslog.LOG_NDELAY,
-            facility=self.__syslog.LOG_USER
-        )
-
-    def __del__(self):
-        self.__syslog.closelog()
-
-    def log_error(self, msg):
-        self.__syslog.syslog(self.__syslog.LOG_ERR, msg)
-
-    def log_warning(self, msg):
-        self.__syslog.syslog(self.__syslog.LOG_WARNING, msg)
-
-    def log_notice(self, msg):
-        self.__syslog.syslog(self.__syslog.LOG_NOTICE, msg)
-
-    def log_info(self, msg):
-        self.__syslog.syslog(self.__syslog.LOG_INFO, msg)
-
-    def log_debug(self, msg):
-        self.__syslog.syslog(self.__syslog.LOG_DEBUG, msg)
-
-
-logger = SyslogLogger(SYSLOG_IDENTIFIER)
-
 
 class LogHelper(object):
     """
@@ -58,6 +28,7 @@ class LogHelper(object):
     """
     FW_ACTION_DOWNLOAD = "download"
     FW_ACTION_INSTALL = "install"
+    FW_ACTION_UPDATE = "update"
 
     STATUS_SUCCESS = "success"
     STATUS_FAILURE = "failure"
@@ -66,7 +37,7 @@ class LogHelper(object):
         caption = "Firmware {} started".format(action)
         template = "{}: component={}, firmware={}"
 
-        logger.log_info(
+        log.log_info(
             template.format(
                 caption,
                 component,
@@ -81,7 +52,7 @@ class LogHelper(object):
         exception_template = "{}: component={}, firmware={}, status={}, exception={}"
 
         if status:
-            logger.log_info(
+            log.log_info(
                 status_template.format(
                     caption,
                     component,
@@ -91,7 +62,7 @@ class LogHelper(object):
             )
         else:
             if exception is None:
-                logger.log_error(
+                log.log_error(
                     status_template.format(
                         caption,
                         component,
@@ -100,7 +71,7 @@ class LogHelper(object):
                     )
                 )
             else:
-                logger.log_error(
+                log.log_error(
                     exception_template.format(
                         caption,
                         component,
@@ -122,8 +93,17 @@ class LogHelper(object):
     def log_fw_install_end(self, component, firmware, status, exception=None):
         self.__log_fw_action_end(self.FW_ACTION_INSTALL, component, firmware, status, exception)
 
+    def log_fw_update_start(self, component, firmware):
+        self.__log_fw_action_start(self.FW_ACTION_UPDATE, component, firmware)
+
+    def log_fw_update_end(self, component, firmware, status, exception=None):
+        self.__log_fw_action_end(self.FW_ACTION_UPDATE, component, firmware, status, exception)
+
     def print_error(self, msg):
         click.echo("Error: {}.".format(msg))
 
     def print_warning(self, msg):
         click.echo("Warning: {}.".format(msg))
+
+    def print_info(self, msg):
+        click.echo("Info: {}.".format(msg))

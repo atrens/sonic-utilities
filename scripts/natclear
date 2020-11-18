@@ -1,4 +1,5 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
+
 """
     Script to clear nat dynamic entries from Hardware and also to clear the nat statistics
 
@@ -12,11 +13,8 @@
 import argparse
 import json
 import sys
-import subprocess
 
-from natsort import natsorted
-from swsssdk import SonicV2Connector
-from tabulate import tabulate
+from swsscommon.swsscommon import SonicV2Connector
 
 class NatClear(object):
 
@@ -26,11 +24,18 @@ class NatClear(object):
         self.db.connect(self.db.APPL_DB)
         return
 
-    def send_notification(self, op, data):
+    def send_entries_notification(self, op, data):
         opdata = [op,data]
         msg = json.dumps(opdata,separators=(',',':'))
-        self.db.publish('APPL_DB','FLUSHNATREQUEST', msg)
+        self.db.publish('APPL_DB','FLUSHNATENTRIES', msg)
         return
+
+    def send_statistics_notification(self, op, data):
+        opdata = [op,data]
+        msg = json.dumps(opdata,separators=(',',':'))
+        self.db.publish('APPL_DB','FLUSHNATSTATISTICS', msg)
+        return
+
 
 def main():
     parser = argparse.ArgumentParser(description='Clear the nat information',
@@ -52,15 +57,13 @@ def main():
     try:
         nat = NatClear()
         if clear_translations:
-            nat.send_notification("ENTRIES", "ALL")
-            print ""
-            print("Dynamic NAT entries are cleared.")
+            nat.send_entries_notification("ENTRIES", "ALL")
+            print("\nDynamic NAT entries are cleared.")
         elif clear_statistics:
-            nat.send_notification("STATISTICS", "ALL")
-            print ""
-            print("NAT statistics are cleared.")
+            nat.send_statistics_notification("STATISTICS", "ALL")
+            print("\nNAT statistics are cleared.")
     except Exception as e:
-        print e.message
+        print(e.message)
         sys.exit(1)
 
 if __name__ == "__main__":

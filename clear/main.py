@@ -1,16 +1,8 @@
-#! /usr/bin/python -u
-
-import click
+import configparser
 import os
 import subprocess
-from click_default_group import DefaultGroup
 
-try:
-    # noinspection PyPep8Naming
-    import ConfigParser as configparser
-except ImportError:
-    # noinspection PyUnresolvedReferences
-    import configparser
+import click
 
 
 # This is from the aliases example:
@@ -35,12 +27,10 @@ class Config(object):
 _config = None
 
 
-# This aliased group has been modified from click examples to inherit from DefaultGroup instead of click.Group.
-# DefaultFroup is a superclass of click.Group which calls a default subcommand instead of showing
-# a help message if no subcommand is passed
-class AliasedGroup(DefaultGroup):
-    """This subclass of a DefaultGroup supports looking up aliases in a config
-    file and with a bit of magic.
+
+class AliasedGroup(click.Group):
+    """This subclass of click.Group supports abbreviations and
+       looking up aliases in a config file with a bit of magic.
     """
 
     def get_command(self, ctx, cmd_name):
@@ -71,12 +61,9 @@ class AliasedGroup(DefaultGroup):
         matches = [x for x in self.list_commands(ctx)
                    if x.lower().startswith(cmd_name.lower())]
         if not matches:
-            # No command name matched. Issue Default command.
-            ctx.arg0 = cmd_name
-            cmd_name = self.default_cmd_name
-            return DefaultGroup.get_command(self, ctx, cmd_name)
+            return None
         elif len(matches) == 1:
-            return DefaultGroup.get_command(self, ctx, matches[0])
+            return click.Group.get_command(self, ctx, matches[0])
         ctx.fail('Too many matches: %s' % ', '.join(sorted(matches)))
 
 
@@ -90,12 +77,13 @@ def get_routing_stack():
         proc = subprocess.Popen(command,
                                 stdout=subprocess.PIPE,
                                 shell=True,
+                                text=True,
                                 stderr=subprocess.STDOUT)
         stdout = proc.communicate()[0]
         proc.wait()
         result = stdout.rstrip('\n')
 
-    except OSError, e:
+    except OSError as e:
         raise OSError("Cannot detect routing-stack")
 
     return (result)
@@ -107,7 +95,7 @@ routing_stack = get_routing_stack()
 
 def run_command(command, pager=False, return_output=False):
     # Provide option for caller function to Process the output.
-    proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
+    proc = subprocess.Popen(command, shell=True, text=True, stdout=subprocess.PIPE)
     if return_output:
         return proc.communicate()
     elif pager:
@@ -374,17 +362,18 @@ def clear_vlan_fdb(vlanid):
 # 'line' command
 #
 @cli.command('line')
-@click.argument('linenum')
-def line(linenum):
+@click.argument('target')
+@click.option('--devicename', '-d', is_flag=True, help="clear by name - if flag is set, interpret target as device name instead")
+def line(target, devicename):
     """Clear preexisting connection to line"""
-    cmd = "consutil clear " + str(linenum)
+    cmd = "consutil clear {}".format("--devicename " if devicename else "") + str(target)
     run_command(cmd)
 
 #
 # 'nat' group ("clear nat ...")
 #
 
-@cli.group(cls=AliasedGroup, default_if_no_args=False)
+@cli.group(cls=AliasedGroup)
 def nat():
     """Clear the nat info"""
     pass

@@ -12,11 +12,13 @@ FORCE=no
 STRICT=no
 REBOOT_METHOD="/sbin/kexec -e"
 ASSISTANT_IP_LIST=""
-ASSISTANT_SCRIPT="/usr/bin/neighbor_advertiser"
+ASSISTANT_SCRIPT="/usr/local/bin/neighbor_advertiser"
+WATCHDOG_UTIL="/usr/local/bin/watchdogutil"
 DEVPATH="/usr/share/sonic/device"
 PLATFORM=$(sonic-cfggen -H -v DEVICE_METADATA.localhost.platform)
 PLATFORM_PLUGIN="${REBOOT_TYPE}_plugin"
-
+LOG_SSD_HEALTH="/usr/local/bin/log_ssd_health"
+SSD_FW_UPDATE="ssd-fw-upgrade"
 # Require 100M available on the hard drive for warm reboot temp files,
 # Size is in 1K blocks:
 MIN_HD_SPACE_NEEDED=100000
@@ -29,7 +31,10 @@ EXIT_NEXT_IMAGE_NOT_EXISTS=4
 EXIT_ORCHAGENT_SHUTDOWN=10
 EXIT_SYNCD_SHUTDOWN=11
 EXIT_FAST_REBOOT_DUMP_FAILURE=12
+EXIT_FILTER_FDB_ENTRIES_FAILURE=13
+EXIT_COUNTERPOLL_DISABLE_FAILURE=14
 EXIT_NO_CONTROL_PLANE_ASSISTANT=20
+EXIT_SONIC_INSTALLER_VERIFY_REBOOT=21
 
 function error()
 {
@@ -92,7 +97,7 @@ function parseOptions()
     done
 }
 
-function clear_fast_boot()
+function common_clear()
 {
     debug "${REBOOT_TYPE} failure ($?) cleanup ..."
 
@@ -101,9 +106,16 @@ function clear_fast_boot()
     teardown_control_plane_assistant
 }
 
+function clear_fast_boot()
+{
+    common_clear
+
+    sonic-db-cli STATE_DB DEL "FAST_REBOOT|system" &>/dev/null || /bin/true
+}
+
 function clear_warm_boot()
 {
-    clear_fast_boot
+    common_clear
 
     result=`timeout 10s config warm_restart disable; if [[ $? == 124 ]]; then echo timeout; else echo "code ($?)"; fi` || /bin/true
     debug "Cancel warm-reboot: ${result}"
@@ -145,6 +157,42 @@ function request_pre_shutdown()
     /usr/bin/docker exec -i syncd /usr/bin/syncd_request_shutdown --pre &> /dev/null || {
         error "Failed to request pre-shutdown"
     }
+}
+
+function recover_issu_bank_file_instruction()
+{
+    debug "To recover (${ISSU_BANK_FILE}) file, do the following:"
+    debug "$ docker exec -it syncd sx_api_dbg_generate_dump.py"
+    debug "$ docker exec -it syncd cat /tmp/sdkdump | grep 'ISSU Bank'"
+    debug "Command above will print the VALUE of ISSU BANK - 0 or 1, use this VALUE in the next command"
+    debug "$ printf VALUE > /host/warmboot/issu_bank.txt"
+}
+
+function check_issu_bank_file()
+{
+    ISSU_BANK_FILE=/host/warmboot/issu_bank.txt
+    MLNX_ISSU_BANK_BROKEN=102
+
+    if [[ ! -s "$ISSU_BANK_FILE" ]]; then
+        error "(${ISSU_BANK_FILE}) does NOT exist or empty ..."
+        recover_issu_bank_file_instruction
+        if [[ "$1" = true ]]; then
+            exit "${MLNX_ISSU_BANK_BROKEN}"
+        fi
+        return
+    fi
+
+    issu_file_chars_count=`stat -c %s ${ISSU_BANK_FILE}`;
+    issu_file_content=`awk '{print $0}' ${ISSU_BANK_FILE}`
+
+    if [[ $issu_file_chars_count != 1 ]] ||
+        [[ "$issu_file_content" != "0" && "$issu_file_content" != "1" ]]; then
+        error "(${ISSU_BANK_FILE}) is broken ..."
+        recover_issu_bank_file_instruction
+        if [[ "$1" = true ]]; then
+            exit "${MLNX_ISSU_BANK_BROKEN}"
+        fi
+    fi
 }
 
 function wait_for_pre_shutdown_complete_or_fail()
@@ -199,7 +247,8 @@ function backup_database()
             end
         end
     " 0 > /dev/null
-    redis-cli save > /dev/null
+    sonic-db-cli SAVE > /dev/null
+    #TODO : need a script to copy all rdb files if there is multiple db instances config
     docker cp database:/var/lib/redis/$REDIS_FILE $WARM_DIR
     docker exec -i database rm /var/lib/redis/$REDIS_FILE
 }
@@ -223,14 +272,23 @@ function teardown_control_plane_assistant()
     fi
 }
 
+function is_secureboot() {
+    grep -Eq 'secure_boot_enable=[1y]' /proc/cmdline
+}
+
 function setup_reboot_variables()
 {
     # Kernel and initrd image
-    NEXT_SONIC_IMAGE=$(sonic_installer list | grep "Next: " | cut -d ' ' -f 2)
+    NEXT_SONIC_IMAGE=$(sonic-installer list | grep "Next: " | cut -d ' ' -f 2)
     IMAGE_PATH="/host/image-${NEXT_SONIC_IMAGE#SONiC-OS-}"
     if grep -q aboot_platform= /host/machine.conf; then
-        KERNEL_IMAGE="$(ls $IMAGE_PATH/boot/vmlinuz-*)"
-        BOOT_OPTIONS="$(cat "$IMAGE_PATH/kernel-cmdline" | tr '\n' ' ') SONIC_BOOT_TYPE=${BOOT_TYPE_ARG}"
+        if is_secureboot; then
+            KERNEL_IMAGE=""
+            BOOT_OPTIONS="SONIC_BOOT_TYPE=${BOOT_TYPE_ARG} secure_boot_enable=1"
+        else
+            KERNEL_IMAGE="$(ls $IMAGE_PATH/boot/vmlinuz-*)"
+            BOOT_OPTIONS="$(cat "$IMAGE_PATH/kernel-cmdline" | tr '\n' ' ') SONIC_BOOT_TYPE=${BOOT_TYPE_ARG}"
+        fi
     elif grep -q onie_platform= /host/machine.conf; then
         KERNEL_OPTIONS=$(cat /host/grub/grub.cfg | sed "/$NEXT_SONIC_IMAGE'/,/}/"'!'"g" | grep linux)
         KERNEL_IMAGE="/host$(echo $KERNEL_OPTIONS | cut -d ' ' -f 2)"
@@ -258,14 +316,16 @@ function reboot_pre_check()
         exit ${EXIT_FILE_SYSTEM_FULL}
     fi
 
-    # Make sure that the next image exists
-    if [[ ! -d ${IMAGE_PATH} ]]; then
-        debug "Next image ${NEXT_SONIC_IMAGE} doesn't exist ..."
-        exit ${EXIT_NEXT_IMAGE_NOT_EXISTS}
+    # Verify the next image by sonic-installer
+    INSTALLER_VERIFY_RC=0
+    sonic-installer verify-next-image > /dev/null || INSTALLER_VERIFY_RC=$?
+    if [[ INSTALLER_VERIFY_RC -ne 0 ]]; then
+        error "Failed to verify next image. Exit code: $INSTALLER_VERIFY_RC"
+        exit ${EXIT_SONIC_INSTALLER_VERIFY_REBOOT}
     fi
     
     # Make sure ASIC configuration has not changed between images
-    ASIC_CONFIG_CHECK_SCRIPT="/usr/bin/asic_config_check"
+    ASIC_CONFIG_CHECK_SCRIPT="/usr/local/bin/asic_config_check"
     ASIC_CONFIG_CHECK_SUCCESS=0
     if [[ "$REBOOT_TYPE" = "warm-reboot" || "$REBOOT_TYPE" = "fastfast-reboot" ]]; then
         ASIC_CONFIG_CHECK_EXIT_CODE=0
@@ -280,6 +340,18 @@ function reboot_pre_check()
             fi
         fi
     fi
+}
+
+function load_aboot_secureboot_kernel() {
+    local next_image="$IMAGE_PATH/sonic.swi"
+    echo "Loading next image from $next_image"
+    unzip -qp "$next_image" boot0 | \
+        swipath=$next_image kexec=true loadonly=true ENV_EXTRA_CMDLINE="$BOOT_OPTIONS" bash -
+}
+
+function load_kernel() {
+    # Load kernel into the memory
+    /sbin/kexec -l "$KERNEL_IMAGE" --initrd="$INITRD" --append="$BOOT_OPTIONS"
 }
 
 function unload_kernel()
@@ -308,6 +380,7 @@ case "$REBOOT_TYPE" in
     "fast-reboot")
         BOOT_TYPE_ARG=$REBOOT_TYPE
         trap clear_fast_boot EXIT HUP INT QUIT TERM KILL ABRT ALRM
+        sonic-db-cli STATE_DB SET "FAST_REBOOT|system" "1" "EX" "180" &>/dev/null
         ;;
     "warm-reboot")
         if [[ "$sonic_asic_type" == "mellanox" ]]; then
@@ -316,9 +389,6 @@ case "$REBOOT_TYPE" in
             # source mlnx-ffb.sh file with
             # functions to check ISSU upgrade possibility
             source mlnx-ffb.sh
-        elif [[ "$sonic_asic_type" == "barefoot" ]]; then
-            REBOOT_TYPE="fastfast-reboot"
-            BOOT_TYPE_ARG="fastfast"
         else
             BOOT_TYPE_ARG="warm"
         fi
@@ -364,19 +434,34 @@ if [[ "$sonic_asic_type" == "mellanox" ]]; then
     fi
 fi
 
-# Load kernel into the memory
-/sbin/kexec -l "$KERNEL_IMAGE" --initrd="$INITRD" --append="$BOOT_OPTIONS"
+
+if is_secureboot && grep -q aboot_machine= /host/machine.conf; then
+    load_aboot_secureboot_kernel
+else
+    load_kernel
+fi
 
 if [[ "$REBOOT_TYPE" = "fast-reboot" ]]; then
     # Dump the ARP and FDB tables to files also as default routes for both IPv4 and IPv6
     # into /host/fast-reboot
-    mkdir -p /host/fast-reboot
+    DUMP_DIR=/host/fast-reboot
+    CONFIG_DB_FILE=/etc/sonic/config_db.json
+    mkdir -p $DUMP_DIR
     FAST_REBOOT_DUMP_RC=0
-    /usr/bin/fast-reboot-dump.py -t /host/fast-reboot || FAST_REBOOT_DUMP_RC=$?
+    /usr/local/bin/fast-reboot-dump.py -t $DUMP_DIR || FAST_REBOOT_DUMP_RC=$?
     if [[ FAST_REBOOT_DUMP_RC -ne 0 ]]; then
         error "Failed to run fast-reboot-dump.py. Exit code: $FAST_REBOOT_DUMP_RC"
         unload_kernel
         exit "${EXIT_FAST_REBOOT_DUMP_FAILURE}"
+    fi
+
+    FILTER_FDB_ENTRIES_RC=0
+    # Filter FDB entries using MAC addresses from ARP table
+    /usr/local/bin/filter_fdb_entries -f $DUMP_DIR/fdb.json -a $DUMP_DIR/arp.json -c $CONFIG_DB_FILE || FILTER_FDB_ENTRIES_RC=$?
+    if [[ FILTER_FDB_ENTRIES_RC -ne 0 ]]; then
+        error "Failed to filter FDb entries. Exit code: $FILTER_FDB_ENTRIES_RC"
+        unload_kernel
+        exit "${EXIT_FILTER_FDB_ENTRIES_FAILURE}"
     fi
 fi
 
@@ -405,22 +490,27 @@ fi
 # service will go down and we cannot recover from it.
 set +e
 
+if [ -x ${LOG_SSD_HEALTH} ]; then
+    debug "Collecting logs to check ssd health before fast-reboot..."
+    ${LOG_SSD_HEALTH}
+fi
+
+
 # Kill nat docker after saving the conntrack table
 debug "Stopping nat ..."
-/usr/bin/dump_nat_entries.py
+/usr/local/bin/dump_nat_entries.py
 docker kill nat > /dev/null || true
 systemctl stop nat
 debug "Stopped nat ..."
 
 # Kill radv before stopping BGP service to prevent annoucing our departure.
-debug "Stopping radv ..."
-docker kill radv &>/dev/null || [ $? == 1 ]
+debug "Stopping radv service..."
 systemctl stop radv
+debug "Stopped radv service..."
 
 # Kill bgpd to start the bgp graceful restart procedure
 debug "Stopping bgp ..."
-docker exec -i bgp pkill -9 zebra
-docker exec -i bgp pkill -9 bgpd || [ $? == 1 ]
+systemctl stop bgp
 debug "Stopped  bgp ..."
 
 # Kill lldp, otherwise it sends informotion about reboot.
@@ -446,20 +536,27 @@ if [[ "$REBOOT_TYPE" = "fast-reboot" ]]; then
     debug "Stopped teamd ..."
 fi
 
-# Kill swss Docker container
-# We call `docker kill swss` to ensure the container stops as quickly as possible,
-# then immediately call `systemctl stop swss` to prevent the service from
-# restarting the container automatically.
-docker kill swss &> /dev/null || debug "Docker swss is not running ($?) ..."
+debug "Stopping swss service ..."
 systemctl stop swss
+debug "Stopped swss service ..."
 
 # Pre-shutdown syncd
 if [[ "$REBOOT_TYPE" = "warm-reboot" || "$REBOOT_TYPE" = "fastfast-reboot" ]]; then
     initialize_pre_shutdown
 
+    BEFORE_PRE_SHUTDOWN=true
+
+    if [[ "x$sonic_asic_type" == x"mellanox" ]]; then
+        check_issu_bank_file "$BEFORE_PRE_SHUTDOWN"
+    fi
+
     request_pre_shutdown
 
     wait_for_pre_shutdown_complete_or_fail
+
+    if [[ "x$sonic_asic_type" == x"mellanox" ]]; then
+        check_issu_bank_file
+    fi
 
     # Warm reboot: dump state to host disk
     if [[ "$REBOOT_TYPE" = "fastfast-reboot" ]]; then
@@ -518,6 +615,19 @@ then
   systemctl stop "$service_name"
 fi
 
+if [[ "$REBOOT_TYPE" = "fast-reboot" ]]; then
+    CONFIG_DB_FILE=/etc/sonic/config_db.json
+    COUNTERPOLL_DISABLE_RC=0
+    # Disable counters in config_db.json
+    /usr/local/bin/counterpoll config-db disable $CONFIG_DB_FILE || COUNTERPOLL_DISABLE_RC=$?
+    if [[ COUNTERPOLL_DISABLE_RC -ne 0 ]]; then
+        error "Failed to disable counterpoll. Exit code: $COUNTERPOLL_DISABLE_RC"
+        /usr/local/bin/counterpoll config-db enable $CONFIG_DB_FILE || COUNTERPOLL_DISABLE_RC=$?
+        unload_kernel
+        exit "${EXIT_COUNTERPOLL_DISABLE_FAILURE}"
+    fi
+fi
+
 # Update the reboot cause file to reflect that user issued this script
 # Upon next boot, the contents of this file will be used to determine the
 # cause of the previous reboot
@@ -533,6 +643,18 @@ if [ -x /sbin/hwclock ]; then
     /sbin/hwclock -w || /bin/true
 fi
 
+if [ -x ${DEVPATH}/${PLATFORM}/${SSD_FW_UPDATE} ]; then
+    debug "updating ssd fw for${REBOOT_TYPE}"
+    ${DEVPATH}/${PLATFORM}/${SSD_FW_UPDATE} ${REBOOT_TYPE}
+fi
+
+# Enable Watchdog Timer
+if [ -x ${WATCHDOG_UTIL} ]; then
+    debug "Enabling Watchdog before ${REBOOT_TYPE}"
+    ${WATCHDOG_UTIL} arm
+fi
+
+# Run platform specific reboot plugin
 if [ -x ${DEVPATH}/${PLATFORM}/${PLATFORM_PLUGIN} ]; then
     debug "Running ${PLATFORM} specific plugin..."
     ${DEVPATH}/${PLATFORM}/${PLATFORM_PLUGIN}

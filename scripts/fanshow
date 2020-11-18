@@ -1,23 +1,36 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
+
 """
     Script to show fan status.
 """
-from __future__ import print_function
 
-import argparse
-
+import os
+import sys
 from tabulate import tabulate
-from swsssdk import SonicV2Connector
 from natsort import natsorted
 
+# mock the redis for unit test purposes #
+try:
+    if os.environ["UTILITIES_UNIT_TESTING"] == "1":
+        modules_path = os.path.join(os.path.dirname(__file__), "..")
+        test_path = os.path.join(modules_path, "tests")
+        sys.path.insert(0, modules_path)
+        sys.path.insert(0, test_path)
+        import mock_tables.dbconnector
+except KeyError:
+    pass
 
-header = ['FAN', 'Speed', 'Direction', 'Presence', 'Status', 'Timestamp']
+from swsscommon.swsscommon import SonicV2Connector
+
+header = ['Drawer', 'LED', 'FAN', 'Speed', 'Direction', 'Presence', 'Status', 'Timestamp']
 
 FAN_TABLE_NAME = 'FAN_INFO'
+DRAWER_FIELD_NAME = 'drawer_name'
 SPEED_FIELD_NAME = 'speed'
 DIRECTION_FIELD_NAME = 'direction'
 PRESENCE_FIELD_NAME = 'presence'
 STATUS_FIELD_NAME = 'status'
+LED_STATUS_FIELD_NAME = 'led_status'
 TIMESTAMP_FIELD_NAME = 'timestamp'
 
 
@@ -52,15 +65,16 @@ class FanShow(object):
 
             presence = data_dict[PRESENCE_FIELD_NAME].lower()
             presence = 'Present' if presence == 'true' else 'Not Present'
-            status = data_dict[STATUS_FIELD_NAME].lower()
-            if status == 'true':
+            
+            status = data_dict[STATUS_FIELD_NAME]
+            status_lower = status.lower()
+            if status_lower == 'true':
                 status = 'OK'
-            elif status == 'false':
+            elif status_lower == 'false':
                 status = 'Not OK'
-            else:
-                status = 'N/A'
 
-            table.append((name, speed, data_dict[DIRECTION_FIELD_NAME], presence, status, data_dict[TIMESTAMP_FIELD_NAME]))
+            table.append((data_dict[DRAWER_FIELD_NAME], data_dict[LED_STATUS_FIELD_NAME], name, speed, data_dict[DIRECTION_FIELD_NAME], presence, status, 
+                          data_dict[TIMESTAMP_FIELD_NAME]))
         
         if table:
             print(tabulate(table, header, tablefmt='simple', stralign='right'))

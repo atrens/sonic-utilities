@@ -1,4 +1,5 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
+
 '''
 Copyright 2019 Broadcom. The term "Broadcom" refers to Broadcom Inc.
 and/or its subsidiaries.
@@ -19,10 +20,8 @@ limitations under the License.
 import sys
 import argparse
 import shlex
-from argparse import RawTextHelpFormatter
 import os
 import subprocess
-import errno
 from swsssdk import ConfigDBConnector
 
 aboot_cfg_template ="/host/image-%s/kernel-cmdline"
@@ -51,7 +50,6 @@ def run_command(cmd, use_shell=False):
     @param use_shell (bool) Execute subprocess with shell access
     '''
 
-    pid = None
     try:
         if isinstance(cmd, list):
             if use_shell is False:
@@ -65,7 +63,7 @@ def run_command(cmd, use_shell=False):
                 shcmd = shlex.split(cmd)
             else:
                 shcmd = cmd
-        proc = subprocess.Popen(shcmd, shell=use_shell, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1, close_fds=True)
+        proc = subprocess.Popen(shcmd, shell=use_shell, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=1, close_fds=True)
         output_stdout, output_stderr = proc.communicate()
         list_stdout = []
         for l in output_stdout.splitlines():
@@ -80,7 +78,7 @@ def run_command(cmd, use_shell=False):
 
 ## Search which SONiC image is the Current image
 def get_current_image():
-    (rc, img, err_str) = run_command("sonic_installer list | grep 'Current: ' | cut -d '-' -f 3-", use_shell=True);
+    (rc, img, err_str) = run_command("sonic-installer list | grep 'Current: ' | cut -d '-' -f 3-", use_shell=True);
     if type(img) == list and len(img) == 1:
         return img[0]
     print_err("Unable to locate current SONiC image")
@@ -88,7 +86,7 @@ def get_current_image():
 
 ## Search which SONiC image is the Next image
 def get_next_image():
-    (rc, img, err_str) = run_command("sonic_installer list | grep 'Next: ' | cut -d '-' -f 3-", use_shell=True);
+    (rc, img, err_str) = run_command("sonic-installer list | grep 'Next: ' | cut -d '-' -f 3-", use_shell=True);
     if type(img) == list and len(img) == 1:
         return img[0]
     print_err("Unable to locate current SONiC image")
@@ -170,7 +168,7 @@ def get_kdump_administrative_mode():
 #
 #  @return The current memory string used for kdump (read from running configuration)
 def get_kdump_memory():
-    (rc, lines, err_str) = run_command("/usr/bin/show kdump memory", use_shell=False)
+    (rc, lines, err_str) = run_command("show kdump memory", use_shell=False)
     try:
         if rc == 0 and len(lines) == 1:
             p = lines[0].find(': ')
@@ -179,7 +177,7 @@ def get_kdump_memory():
                 #print(lines[0][p+2:])
                 #print('XXX')
                 return lines[0][p+2:]
-    except:
+    except Exception:
         pass
     return "0M-2G:256M,2G-4G:320M,4G-8G:384M,8G-:448M"
 
@@ -188,13 +186,13 @@ def get_kdump_memory():
 #  @return The maximum number of kernel dump files stored locally
 #          (read from running configuration)
 def get_kdump_num_dumps():
-    (rc, lines, err_str) = run_command("/usr/bin/show kdump num_dumps", use_shell=False)
+    (rc, lines, err_str) = run_command("show kdump num_dumps", use_shell=False)
     try:
         if rc == 0 and len(lines) == 1:
             p = lines[0].find(': ')
             if p != -1:
                 return int(lines[0][p+2:])
-    except:
+    except Exception:
         pass
     return 3
 
@@ -280,7 +278,7 @@ def kdump_enable(verbose, kdump_enabled, memory, num_dumps, image, cmdline_file)
     crash_kernel_mem = search_for_crash_kernel(lines[img_index])
     if verbose:
         print("crash_kernel_mem=[%s]" % crash_kernel_mem)
-    if crash_kernel_mem == None:
+    if crash_kernel_mem is None:
         lines[img_index] += " crashkernel=%s" % memory
         changed = True
         if verbose:
@@ -337,6 +335,7 @@ def cmd_kdump_config_next(verbose):
 ## Disable kdump
 #
 #  @param verbose If True, the function will display a few additional information
+#  @return        True if the grub/cmdline cfg has changed, and False if it has not
 def kdump_disable(verbose, kdump_enabled, memory, num_dumps, image, cmdline_file):
     write_use_kdump(0)
 
@@ -347,7 +346,7 @@ def kdump_disable(verbose, kdump_enabled, memory, num_dumps, image, cmdline_file
 
     changed = False
     crash_kernel_mem = search_for_crash_kernel(lines[img_index])
-    if crash_kernel_mem == None:
+    if crash_kernel_mem is None:
         print("kdump is already disabled")
     else:
         lines[img_index] = lines[img_index].replace("crashkernel="+crash_kernel_mem, "")
@@ -357,6 +356,8 @@ def kdump_disable(verbose, kdump_enabled, memory, num_dumps, image, cmdline_file
 
     if changed:
         rewrite_cfg(lines, cmdline_file)
+
+    return changed
 
 ## Command: Disable kdump
 #
@@ -385,8 +386,8 @@ def cmd_kdump_disable(verbose, image=get_current_image()):
 #  @param memory  If not None, new value to set. 
 #                 If None, display current value read from running configuration
 def cmd_kdump_memory(verbose, memory):
-    if memory == None:
-        (rc, lines, err_str) = run_command("/usr/bin/show kdump memory", use_shell=False);
+    if memory is None:
+        (rc, lines, err_str) = run_command("show kdump memory", use_shell=False);
         print('\n'.join(lines))
     else:
         use_kdump_in_cfg = read_use_kdump()
@@ -402,22 +403,22 @@ def cmd_kdump_memory(verbose, memory):
 #  @param memory  If not None, new value to set. 
 #                 If None, display current value read from running configuration
 def cmd_kdump_num_dumps(verbose, num_dumps):
-    if num_dumps == None:
-        (rc, lines, err_str) = run_command("/usr/bin/show kdump num_dumps", use_shell=False);
+    if num_dumps is None:
+        (rc, lines, err_str) = run_command("show kdump num_dumps", use_shell=False);
         print('\n'.join(lines))
     else:
         write_num_dumps(num_dumps)
 
 ## Command: Display kdump status
 def cmd_kdump_status():
-    print 'Kdump Administrative Mode: ',
+    print('Kdump Administrative Mode: ', end='')
     kdump_enabled = get_kdump_administrative_mode()
     if kdump_enabled:
         print('Enabled')
     else:
         print('Disabled')
 
-    print 'Kdump Operational State:   ',
+    print('Kdump Operational State:   ', end='')
     (rc, lines, err_str) = run_command("/usr/sbin/kdump-config status", use_shell=False);
     if len(lines) >= 1 and ": ready to kdump" in lines[0]:
         use_kdump_in_cfg = read_use_kdump()
@@ -481,7 +482,7 @@ def cmd_kdump_file(num_lines, filename):
                     if x.find(filename) != -1:
                         fname = x
                         break
-                if fname == None:
+                if fname is None:
                     print("Invalid key")
                     sys.exit(1)
             (rc, lines, err_str) = run_command("/usr/bin/tail -n %d %s" % (num_lines, fname), use_shell=False);
@@ -497,7 +498,7 @@ def main():
 
     # Add allowed arguments
     parser = argparse.ArgumentParser(description="kdump configuration and status tool",
-                                     formatter_class=RawTextHelpFormatter)
+                                     formatter_class=argparse.RawTextHelpFormatter)
 
     # Enable kdump on Current image
     parser.add_argument('--enable', action='store_true',

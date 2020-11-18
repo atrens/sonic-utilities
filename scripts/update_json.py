@@ -1,7 +1,6 @@
 #! /usr/bin/env python
 
 import os
-import sys
 import json
 import argparse
 
@@ -9,7 +8,7 @@ TMP_SUFFIX = ".tmp"
 BAK_SUFFIX = ".bak"
 
 def dict_update(dst, patch):
-    for k in patch.keys():
+    for k in patch:
         if type(patch[k]) == dict:
             dst[k] = dict_update(dst[k], patch[k])
         else:
